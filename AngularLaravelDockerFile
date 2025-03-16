@@ -1,0 +1,111 @@
+# ========================
+# Base Environment Setup
+# ========================
+FROM ubuntu:20.04 AS base
+
+# Prevent interactive prompts (fix tzdata issue)
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    npm \
+    php-cli \
+    php-mbstring \
+    php-xml \
+    php-bcmath \
+    php-curl \
+    php-zip \
+    unzip \
+    composer \
+    nginx \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# ========================
+# Clone Repositories
+# ========================
+FROM base AS source
+
+WORKDIR /app
+RUN git clone --depth=1 https://github.com/khaledosman/angular-realworld-example-app.git frontend \
+    && git clone --depth=1 https://github.com/f1amy/laravel-realworld-example-app.git backend
+
+# ========================
+# Frontend Build (Angular)
+# ========================
+FROM node:18 AS frontend-build
+
+WORKDIR /app/frontend
+COPY --from=source /app/frontend ./
+
+# Install dependencies and build the project
+RUN npm install --legacy-peer-deps \
+    && npm run build --prod || { echo "Angular build failed"; exit 1; }
+
+# Debugging step: Verify the output folder exists
+RUN ls -l /app/frontend/dist
+
+# ========================
+# Backend Setup (Laravel)
+# ========================
+FROM php:8.1-fpm AS backend-build
+
+WORKDIR /app/backend
+COPY --from=source /app/backend ./
+
+# Install required system dependencies, PHP extensions, and Composer
+RUN apt-get update && apt-get install -y zip unzip git curl libpng-dev \
+    && docker-php-ext-install pdo pdo_mysql gd \
+    && curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer \
+    && composer install --no-dev --optimize-autoloader
+
+# Set correct permissions
+RUN chown -R www-data:www-data /app/backend/storage /app/backend/bootstrap/cache
+
+# ========================
+# Final Container (PHP-FPM + Nginx)
+# ========================
+FROM php:8.1-fpm-alpine AS final
+
+# Install Nginx
+RUN apk add --no-cache nginx
+
+# Set up working directory
+WORKDIR /app
+
+# Copy frontend build files from Angular's `dist/` directory
+COPY --from=frontend-build /app/frontend/dist /usr/share/nginx/html
+
+# Copy backend app to final image
+COPY --from=backend-build /app/backend /app/backend
+WORKDIR /app/backend
+
+# Fix permissions for Laravel storage & cache
+RUN chown -R www-data:www-data /app/backend/storage /app/backend/bootstrap/cache
+
+# Inject Nginx configuration inside the container
+RUN echo ' \
+server { \
+    listen 80; \
+    server_name localhost; \
+    root /usr/share/nginx/html; \
+    index index.html; \
+    location / { \
+        try_files $uri $uri/ /index.html; \
+    } \
+    location /api/ { \
+        proxy_pass http://127.0.0.1:9000; \
+        proxy_set_header Host $host; \
+        proxy_set_header X-Real-IP $remote_addr; \
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; \
+        proxy_set_header X-Forwarded-Proto $scheme; \
+    } \
+}' > /etc/nginx/http.d/default.conf
+
+# Expose ports (80 for frontend, 9000 for Laravel PHP-FPM)
+EXPOSE 80 9000
+
+# Start services (Laravel PHP-FPM and Nginx)
+CMD ["sh", "-c", "php-fpm & nginx -g 'daemon off;'"]
